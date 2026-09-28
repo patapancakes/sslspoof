@@ -62,6 +62,14 @@ var (
 	authorityKey  = mustParsePrivateKeyPEM(authorityKeyPEM)
 )
 
+func appendUint24(b []byte, v uint32) []byte {
+	return append(b,
+		byte(v>>16),
+		byte(v>>8),
+		byte(v),
+	)
+}
+
 func GetServerCertsRecord(host string, md5 bool) ([]byte, error) {
 	algo := x509.SHA1WithRSA
 	if md5 {
@@ -93,32 +101,21 @@ func GetServerCertsRecord(host string, md5 bool) ([]byte, error) {
 	b = append(b, 0x0B) // Handshake Type (Certificate)
 
 	// Length of handshake message
-	b = append(b, 0x00) // padding byte to fit uint24
-	b = binary.BigEndian.AppendUint16(b, uint16(certLen+certLenCA+12))
+	b = appendUint24(b, uint32(certLen+certLenCA+12))
 
 	// Length of certificates
-	b = append(b, 0x00) // padding
-	b = binary.BigEndian.AppendUint16(b, uint16(certLen+certLenCA+9))
+	b = appendUint24(b, uint32(certLen+certLenCA+9))
 
-	// Length of certificate (leaf)
-	b = append(b, 0x00) // padding
-	b = binary.BigEndian.AppendUint16(b, uint16(certLen))
-
-	// Certificate data (leaf)
+	// Certificate (leaf)
+	b = appendUint24(b, uint32(certLen)) // length
 	b = append(b, cert...)
 
-	// Length of certificate (authority)
-	b = append(b, 0x00) // padding
-	b = binary.BigEndian.AppendUint16(b, uint16(len(authorityCert.Raw)))
-
-	// Certificate data (authority)
+	// Certificate (authority)
+	b = appendUint24(b, uint32(len(authorityCert.Raw)))
 	b = append(b, authorityCert.Raw...)
 
-	// Length of certificate (intermediate)
-	b = append(b, 0x00) // padding
-	b = binary.BigEndian.AppendUint16(b, uint16(len(intermediateCert.Raw)))
-
-	// Certificate data (intermediate)
+	// Certificate (intermediate)
+	b = appendUint24(b, uint32(len(intermediateCert.Raw)))
 	b = append(b, intermediateCert.Raw...)
 
 	b = append(b, []byte{
@@ -449,11 +446,20 @@ func (s *session) Read(b []byte) (n int, err error) {
 }
 
 func (s *session) Write(b []byte) (n int, err error) {
-	record := []byte{0x17, 0x03, 0x00}
-	record = binary.BigEndian.AppendUint16(record, uint16(len(b)))
+	var written int
+	for chunk := range slices.Chunk(b, 0x4000-5-md5.Size) {
+		record := []byte{0x17, 0x03, 0x00}
+		record = binary.BigEndian.AppendUint16(record, uint16(len(chunk)))
 
-	record, s.seq = encryptSSL(s.macFn, s.cipher, b, s.seq, record)
-	return s.Conn.Write(record)
+		record, s.seq = encryptSSL(s.macFn, s.cipher, chunk, s.seq, record)
+		n, err := s.Conn.Write(record)
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+
+	return written, nil
 }
 
 // The following functions are modified from the crypto standard library
