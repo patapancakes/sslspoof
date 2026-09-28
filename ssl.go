@@ -1,6 +1,3 @@
-// modified from https://github.com/WiiLink24/wfc-server/blob/main/nas/tls.go
-// licensed under GNU AFFERO GENERAL PUBLIC LICENSE Version 3, see LICENSE
-
 package sslspoof
 
 import (
@@ -111,35 +108,72 @@ func (c *conn) Close() error {
 
 // handshake handles the SSL request, and creates session for further communication.
 func (c *conn) handshake(host string, useMD5 bool) error {
-	in := make([]byte, 1400)
-	n, err := c.Conn.Read(in)
+	// Client Hello
+	clientHelloHeader, err := readN[byte](c.Conn, 5)
 	if err != nil {
-		return fmt.Errorf("failed to read client hello: %w", err)
-	}
-	if n < 1 {
-		return errors.New("short client hello")
+		return err
 	}
 
-	clientHello := in[:n]
-
-	var clientRandom []byte
+	isSSL2 := clientHelloHeader[0] == 0x80
 	finishHash := newFinishedHash()
 
-	if clientHello[0] == 0x80 { // SSLv2 Client Hello
-		if n < 0x20 {
+	var clientHelloLen int
+	if isSSL2 { // SSLv2
+		clientHelloLen = int(clientHelloHeader[1])
+		if clientHelloLen < 0x20 {
 			return errors.New("short client hello")
 		}
 
-		clientRandom = clientHello[n-0x20:]
-		finishHash.Write(clientHello[2:]) // skip length bytes
-	} else { // SSLv3 Client Hello
-		if n < 0x34 {
+		// taken by clientHelloHeader
+		clientHelloLen -= 3
+
+		finishHash.Write(clientHelloHeader[2:])
+	} else { // SSLv3
+		clientHelloLen = int(binary.BigEndian.Uint16(clientHelloHeader[3:]))
+		if clientHelloLen < 0x34 {
 			return errors.New("short client hello")
 		}
-
-		clientRandom = clientHello[0x0B : 0x0B+0x20]
-		finishHash.Write(clientHello[5:])
 	}
+
+	clientHelloBody, err := readN[byte](c.Conn, clientHelloLen)
+	if err != nil {
+		return err
+	}
+
+	needsExport := true
+	var clientRandom []byte
+
+	if isSSL2 {
+		ciphersLen := binary.BigEndian.Uint16(clientHelloBody)
+		if clientHelloLen < 6+int(ciphersLen) {
+			return errors.New("short client hello")
+		}
+		for chunk := range slices.Chunk(clientHelloBody[6:6+ciphersLen], 3) {
+			// look for SSL_RSA_WITH_RC4_128_MD5
+			if bytes.Equal(chunk, []byte{0x00, 0x00, 0x04}) {
+				needsExport = false
+				break
+			}
+		}
+
+		clientRandom = clientHelloBody[clientHelloLen-32:]
+	} else {
+		ciphersLen := binary.BigEndian.Uint16(clientHelloBody[39:])
+		if clientHelloLen < 39+2+int(ciphersLen) {
+			return errors.New("short client hello")
+		}
+		for chunk := range slices.Chunk(clientHelloBody[39+2:39+2+ciphersLen], 2) {
+			// look for SSL_RSA_WITH_RC4_128_MD5
+			if bytes.Equal(chunk, []byte{0x00, 0x04}) {
+				needsExport = false
+				break
+			}
+		}
+
+		clientRandom = clientHelloBody[6 : 6+32]
+	}
+
+	finishHash.Write(clientHelloBody)
 
 	// Server Hello
 	serverHello := []byte{
@@ -162,11 +196,16 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	// Send an empty session ID
 	serverHello = append(serverHello, 0x00)
 
-	// Select cipher suite and compression method
-	serverHello = append(serverHello, []byte{
-		0x00, 0x04, // Cipher Suite (SSL_RSA_WITH_RC4_128_MD5)
-		0x00, // Compression Method (NULL)
-	}...)
+	// Select cipher suite
+	cipherSuite := []byte{0x00, 0x04} // SSL_RSA_WITH_RC4_128_MD5
+	if needsExport {
+		cipherSuite = []byte{0x00, 0x03} // SSL_RSA_EXPORT_WITH_RC4_40_MD5
+	}
+
+	serverHello = append(serverHello, cipherSuite...)
+
+	// Select compression method
+	serverHello = append(serverHello, 0x00) // NULL
 
 	finishHash.Write(serverHello[5:])
 	c.Conn.Write(serverHello)
@@ -177,12 +216,17 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		algo = x509.MD5WithRSA
 	}
 
+	certKey := authorityKey
+	if needsExport {
+		certKey, _ = rsa.GenerateKey(rand.Reader, 512)
+	}
+
 	cert, err := CreateCertificate(rand.Reader, &x509.Certificate{
 		Subject:            pkix.Name{CommonName: host},
 		NotBefore:          intermediateCert.NotBefore,
 		NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
 		SignatureAlgorithm: algo,
-	}, authorityCert, &authorityKey.PublicKey, authorityKey)
+	}, authorityCert, &certKey.PublicKey, authorityKey)
 	if err != nil {
 		return err
 	}
@@ -231,21 +275,21 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	c.Conn.Write(serverHelloDone)
 
 	// Client Key Exchange
-	clientKeyExchange, err := readN[byte](c.Conn, 5+132)
+	clientKeyExchange, err := readN[byte](c.Conn, 5+4+certKey.PublicKey.Size())
 	if err != nil {
 		return errors.New("failed to read client key exchange")
 	}
 	if !bytes.HasPrefix(clientKeyExchange, []byte{
 		0x16,       // Content Type (Handshake)
 		0x03, 0x00, // Version (SSLv3)
-		0x00, 0x84, // Length (132)
-		0x10,             // Handshake Type (Client Key Exchange)
-		0x00, 0x00, 0x80, // Length (128)
+		0x00, byte(1 + 3 + certKey.PublicKey.Size()), // Length (4 + RSA Key Size)
+		0x10,                                       // Handshake Type (Client Key Exchange)
+		0x00, 0x00, byte(certKey.PublicKey.Size()), // Length (RSA Key Size)
 	}) {
 		return errors.New("invalid client key exchange header")
 	}
 
-	encryptedPreMasterSecret := clientKeyExchange[5+1+3:]
+	encryptedPreMasterSecret := clientKeyExchange[5+4:]
 	finishHash.Write(clientKeyExchange[5:])
 
 	// Change Cipher Spec
@@ -263,7 +307,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	}
 
 	// Finished
-	finished, err := readN[byte](c.Conn, 5+1+3+md5.Size+sha1.Size+md5.Size)
+	finished, err := readN[byte](c.Conn, 5+4+md5.Size+sha1.Size+md5.Size)
 	if err != nil {
 		return errors.New("failed to read client finished")
 	}
@@ -278,7 +322,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	clientFinish := finished[5:]
 
 	// Decrypt the pre master secret using our RSA key
-	preMasterSecret, err := rsa.DecryptPKCS1v15(rand.Reader, authorityKey, encryptedPreMasterSecret)
+	preMasterSecret, err := rsa.DecryptPKCS1v15(rand.Reader, certKey, encryptedPreMasterSecret)
 	if err != nil {
 		return fmt.Errorf("failed to decrypt pre master secret: %w", err)
 	}
@@ -292,8 +336,18 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	masterSecret := make([]byte, 48)
 	prf30(masterSecret, preMasterSecret, []byte("master secret"), append(clientRandom, serverRandom...))
 
+	keyLen := 16 // 128-bit
+	if needsExport {
+		keyLen = 5 // 40-bit
+	}
+
+	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, md5.Size, keyLen, 0)
+	if needsExport {
+		clientKey = exportRC4Key(clientKey, clientRandom, serverRandom, true)
+		serverKey = exportRC4Key(serverKey, clientRandom, serverRandom, false)
+	}
+
 	s := session{Conn: c.Conn}
-	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, md5.Size, 16, 0)
 
 	// Create the MAC function
 	s.macFn = ssl30MAC{
@@ -332,7 +386,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	}
 
 	// Encrypt the finished record
-	finishedRecord, s.seq = encryptSSL(s.macFn, s.cipher, append([]byte{
+	finishedRecord, s.seq = encrypt(s.macFn, s.cipher, append([]byte{
 		0x14,             // Handshake Type (Finished)
 		0x00, 0x00, 0x24, // Length (36)
 	}, finishHash.serverSum(masterSecret)...), s.seq, finishedRecord)
@@ -343,6 +397,20 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	c.handshaked = true
 
 	return nil
+}
+
+func exportRC4Key(key, clientRandom, serverRandom []byte, client bool) []byte {
+	b := bytes.Clone(key)
+	if client {
+		b = append(b, clientRandom...)
+		b = append(b, serverRandom...)
+	} else {
+		b = append(b, serverRandom...)
+		b = append(b, clientRandom...)
+	}
+
+	sum := md5.Sum(b)
+	return sum[:]
 }
 
 type session struct {
@@ -424,7 +492,7 @@ func (s *session) Write(b []byte) (n int, err error) {
 		record := []byte{0x17, 0x03, 0x00}
 		record = binary.BigEndian.AppendUint16(record, uint16(len(chunk)))
 
-		record, s.seq = encryptSSL(s.macFn, s.cipher, chunk, s.seq, record)
+		record, s.seq = encrypt(s.macFn, s.cipher, chunk, s.seq, record)
 		n, err := s.Conn.Write(record)
 		written += n
 		if err != nil {
@@ -586,7 +654,7 @@ func (h finishedHash) serverSum(masterSecret []byte) []byte {
 	return finishedSum30(h.serverMD5, h.server, masterSecret, [4]byte{0x53, 0x52, 0x56, 0x52})
 }
 
-func encryptSSL(macFn macFunction, cipher *rc4.Cipher, payload []byte, seq uint64, record []byte) ([]byte, uint64) {
+func encrypt(macFn macFunction, cipher *rc4.Cipher, payload []byte, seq uint64, record []byte) ([]byte, uint64) {
 	mac := macFn.MAC([]byte{}, binary.BigEndian.AppendUint64([]byte{}, seq), record[:5], payload, nil)
 
 	record = append(append(bytes.Clone(record[:5]), payload...), mac...)
