@@ -83,8 +83,7 @@ func readN[T any](r io.Reader, n int) ([]T, error) {
 
 type conn struct {
 	net.Conn
-	handshaked bool
-	session    io.ReadWriter
+	session io.ReadWriter
 }
 
 func (c *conn) Read(b []byte) (int, error) {
@@ -93,17 +92,6 @@ func (c *conn) Read(b []byte) (int, error) {
 
 func (c *conn) Write(b []byte) (int, error) {
 	return c.session.Write(b)
-}
-
-func (c *conn) Close() error {
-	if c.session != nil {
-		conn, ok := c.session.(io.Closer)
-		if ok {
-			conn.Close()
-		}
-	}
-
-	return c.Conn.Close()
 }
 
 // handshake handles the SSL request, and creates session for further communication.
@@ -394,7 +382,6 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	c.Conn.Write(finishedRecord)
 
 	c.session = &s
-	c.handshaked = true
 
 	return nil
 }
@@ -461,13 +448,8 @@ func (s *session) Read(b []byte) (n int, err error) {
 
 	// if alert
 	if recordType == 0x15 {
-		if record[0] == 0x01 && record[1] == 0x00 {
-			// connection closed
-			err = s.Close()
-			if err != nil {
-				return 0, err
-			}
-
+		if record[0] == 0x01 && record[1] == 0x00 { // connection closed
+			s.Close()
 			return 0, io.EOF
 		}
 
