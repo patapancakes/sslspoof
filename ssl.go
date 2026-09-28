@@ -70,65 +70,6 @@ func appendUint24(b []byte, v uint32) []byte {
 	)
 }
 
-func GetServerCertsRecord(host string, md5 bool) ([]byte, error) {
-	algo := x509.SHA1WithRSA
-	if md5 {
-		algo = x509.MD5WithRSA
-	}
-
-	cert, err := CreateCertificate(rand.Reader, &x509.Certificate{
-		Subject:            pkix.Name{CommonName: host},
-		NotBefore:          intermediateCert.NotBefore,
-		NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
-		SignatureAlgorithm: algo,
-	}, authorityCert, &authorityKey.PublicKey, authorityKey)
-	if err != nil {
-		return nil, err
-	}
-
-	var b []byte
-	b = []byte{
-		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSLv3)
-	}
-
-	certLen := len(cert)
-	certLenCA := len(authorityCert.Raw) + len(intermediateCert.Raw)
-
-	// Length of the record
-	b = binary.BigEndian.AppendUint16(b, uint16(certLen+certLenCA+16))
-
-	b = append(b, 0x0B) // Handshake Type (Certificate)
-
-	// Length of handshake message
-	b = appendUint24(b, uint32(certLen+certLenCA+12))
-
-	// Length of certificates
-	b = appendUint24(b, uint32(certLen+certLenCA+9))
-
-	// Certificate (leaf)
-	b = appendUint24(b, uint32(certLen)) // length
-	b = append(b, cert...)
-
-	// Certificate (authority)
-	b = appendUint24(b, uint32(len(authorityCert.Raw)))
-	b = append(b, authorityCert.Raw...)
-
-	// Certificate (intermediate)
-	b = appendUint24(b, uint32(len(intermediateCert.Raw)))
-	b = append(b, intermediateCert.Raw...)
-
-	b = append(b, []byte{
-		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSLv3)
-		0x00, 0x04, // Length (4)
-		0x0E,             // Handshake Type (Server Hello Done)
-		0x00, 0x00, 0x00, // Length (0)
-	}...)
-
-	return b, nil
-}
-
 type conn struct {
 	net.Conn
 	handshaked bool
@@ -186,6 +127,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		finishHash.Write(clientHello[0x5:0x34])
 	}
 
+	// Server Hello
 	serverHello := []byte{
 		0x16,       // Content Type (Handshake)
 		0x03, 0x00, // Version (SSLv3)
@@ -212,22 +154,67 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		0x00, // Compression Method (NULL)
 	}...)
 
-	scr, err := GetServerCertsRecord(host, useMD5)
+	finishHash.Write(serverHello[0x5:])
+	c.Conn.Write(serverHello)
+
+	// Certificates
+	algo := x509.SHA1WithRSA
+	if useMD5 {
+		algo = x509.MD5WithRSA
+	}
+
+	cert, err := CreateCertificate(rand.Reader, &x509.Certificate{
+		Subject:            pkix.Name{CommonName: host},
+		NotBefore:          intermediateCert.NotBefore,
+		NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
+		SignatureAlgorithm: algo,
+	}, authorityCert, &authorityKey.PublicKey, authorityKey)
 	if err != nil {
 		return err
 	}
 
-	// Append the certs record to the server hello buffer
-	serverHello = append(serverHello, scr...)
+	certs := [][]byte{cert, authorityCert.Raw, intermediateCert.Raw}
 
-	finishHash.Write(serverHello[0x5:0x2F])
-	finishHash.Write(serverHello[0x34 : 0x34+(len(scr)-14)])
-	finishHash.Write(serverHello[0x34+(len(scr)-14)+5 : 0x34+(len(scr)-14)+5+4])
-
-	_, err = c.Conn.Write(serverHello)
-	if err != nil {
-		return fmt.Errorf("failed to write to client: %w", err)
+	var certsLen int
+	for _, cert := range certs {
+		certsLen += len(cert)
 	}
+
+	certificates := []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSLv3)
+	}
+
+	// Length of the record
+	certificates = binary.BigEndian.AppendUint16(certificates, uint16(1+3+3+(len(certs)*3)+certsLen))
+
+	certificates = append(certificates, 0x0B) // Handshake Type (Certificate)
+
+	// Length of handshake message
+	certificates = appendUint24(certificates, uint32(3+(len(certs)*3)+certsLen))
+
+	// Length of certificates
+	certificates = appendUint24(certificates, uint32((len(certs)*3)+certsLen))
+
+	for _, cert := range certs {
+		certificates = appendUint24(certificates, uint32(len(cert)))
+		certificates = append(certificates, cert...)
+	}
+
+	finishHash.Write(certificates[5:])
+	c.Conn.Write(certificates)
+
+	// Server Hello Done
+	serverHelloDone := []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSLv3)
+		0x00, 0x04, // Length (4)
+		0x0E,             // Handshake Type (Server Hello Done)
+		0x00, 0x00, 0x00, // Length (0)
+	}
+
+	finishHash.Write(serverHelloDone[5:])
+	c.Conn.Write(serverHelloDone)
 
 	buf := make([]byte, 0x1000)
 	index := 0
@@ -299,7 +286,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		return errors.New("invalid SSL version in pre master secret")
 	}
 
-	clientServerRandom := append(bytes.Clone(clientRandom), serverRandom[:0x20]...)
+	clientServerRandom := append(bytes.Clone(clientRandom), serverRandom...)
 
 	masterSecret := make([]byte, 48)
 	prf30(masterSecret, preMasterSecret, []byte("master secret"), clientServerRandom)
