@@ -1,6 +1,3 @@
-// modified from https://github.com/WiiLink24/wfc-server/blob/main/nas/listener.go
-// licensed under GNU AFFERO GENERAL PUBLIC LICENSE Version 3, see LICENSE
-
 package sslspoof
 
 import (

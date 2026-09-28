@@ -70,6 +70,20 @@ func appendUint24(b []byte, v uint32) []byte {
 	)
 }
 
+func read[T any](r io.Reader) (T, error) {
+	var value T
+
+	err := binary.Read(r, binary.BigEndian, &value)
+	return value, err
+}
+
+func readN[T any](r io.Reader, n int) ([]T, error) {
+	value := make([]T, n)
+
+	err := binary.Read(r, binary.BigEndian, &value)
+	return value, err
+}
+
 type conn struct {
 	net.Conn
 	handshaked bool
@@ -123,8 +137,8 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 			return errors.New("short client hello")
 		}
 
-		clientRandom = clientHello[0x0b : 0x0b+0x20]
-		finishHash.Write(clientHello[0x5:0x34])
+		clientRandom = clientHello[0x0B : 0x0B+0x20]
+		finishHash.Write(clientHello[5:])
 	}
 
 	// Server Hello
@@ -154,7 +168,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		0x00, // Compression Method (NULL)
 	}...)
 
-	finishHash.Write(serverHello[0x5:])
+	finishHash.Write(serverHello[5:])
 	c.Conn.Write(serverHello)
 
 	// Certificates
@@ -216,115 +230,100 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	finishHash.Write(serverHelloDone[5:])
 	c.Conn.Write(serverHelloDone)
 
-	buf := make([]byte, 0x1000)
-	index := 0
-	// Read client key exchange (+ change cipher spec + finished)
-	for {
-		var n int
-		n, err = c.Conn.Read(buf[index:])
-		if err != nil {
-			return fmt.Errorf("failed to read key exchange: %w", err)
-		}
-
-		index += n
-
-		if index > 0x09 {
-			// Check client key exchange header
-			if !bytes.HasPrefix(buf, []byte{
-				0x16,       // Content Type (Handshake)
-				0x03, 0x00, // Version (SSLv3)
-				0x00, 0x84, // Length (132)
-				0x10,             // Handshake Type (Client Key Exchange)
-				0x00, 0x00, 0x80, // Length (128)
-			}) {
-				return errors.New("invalid client key exchange header")
-			}
-		}
-
-		if index > 0x8B {
-			// Check change cipher spec + finished header
-			if !bytes.HasPrefix(buf[0x89:], []byte{
-				0x14,       // Content Type (Change Cipher Spec)
-				0x03, 0x00, // Version (SSLv3)
-				0x00, 0x01, // Length (1)
-				0x01, // Change Cipher Spec Message
-
-				0x16,       // Content Type (Handshake)
-				0x03, 0x00, // Version (SSLv3)
-				0x00, 0x38, // Length (56)
-			}) {
-				return errors.New("invalid client change cipher spec + finished header")
-			}
-		}
-
-		if index == 0xCC {
-			buf = buf[:index]
-			break
-		}
-
-		if index > 0xCC {
-			return errors.New("invalid client key exchange length")
-		}
+	// Client Key Exchange
+	clientKeyExchange, err := readN[byte](c.Conn, 5+132)
+	if err != nil {
+		return errors.New("failed to read client key exchange")
+	}
+	if !bytes.HasPrefix(clientKeyExchange, []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSLv3)
+		0x00, 0x84, // Length (132)
+		0x10,             // Handshake Type (Client Key Exchange)
+		0x00, 0x00, 0x80, // Length (128)
+	}) {
+		return errors.New("invalid client key exchange header")
 	}
 
-	encryptedPreMasterSecret := buf[0x09 : 0x09+0x80]
-	clientFinish := buf[0x94 : 0x94+0x38]
+	encryptedPreMasterSecret := clientKeyExchange[5+1+3:]
+	finishHash.Write(clientKeyExchange[5:])
 
-	finishHash.Write(buf[0x5 : 0x5+0x84])
+	// Change Cipher Spec
+	changeCipherSpec, err := readN[byte](c.Conn, 5+1)
+	if err != nil {
+		return errors.New("failed to read client change cipher spec")
+	}
+	if !bytes.HasPrefix(changeCipherSpec, []byte{
+		0x14,       // Content Type (Change Cipher Spec)
+		0x03, 0x00, // Version (SSLv3)
+		0x00, 0x01, // Length (1)
+		0x01, // Change Cipher Spec Message
+	}) {
+		return errors.New("invalid client change cipher spec")
+	}
+
+	// Finished
+	finished, err := readN[byte](c.Conn, 5+1+3+md5.Size+sha1.Size+md5.Size)
+	if err != nil {
+		return errors.New("failed to read client finished")
+	}
+	if !bytes.HasPrefix(finished, []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSLv3)
+		0x00, 0x38, // Length (56)
+	}) {
+		return errors.New("invalid client finished header")
+	}
+
+	clientFinish := finished[5:]
 
 	// Decrypt the pre master secret using our RSA key
 	preMasterSecret, err := rsa.DecryptPKCS1v15(rand.Reader, authorityKey, encryptedPreMasterSecret)
 	if err != nil {
 		return fmt.Errorf("failed to decrypt pre master secret: %w", err)
 	}
-
 	if len(preMasterSecret) != 48 {
 		return errors.New("invalid pre master secret length")
 	}
-
 	if !bytes.HasPrefix(preMasterSecret, []byte{0x03, 0x00}) {
-		return errors.New("invalid SSL version in pre master secret")
+		return errors.New("invalid ssl version in pre master secret")
 	}
 
-	clientServerRandom := append(bytes.Clone(clientRandom), serverRandom...)
-
 	masterSecret := make([]byte, 48)
-	prf30(masterSecret, preMasterSecret, []byte("master secret"), clientServerRandom)
+	prf30(masterSecret, preMasterSecret, []byte("master secret"), append(clientRandom, serverRandom...))
 
-	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, md5.Size, 16, 16)
+	s := session{Conn: c.Conn}
+	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, md5.Size, 16, 0)
+
+	// Create the MAC function
+	s.macFn = ssl30MAC{
+		h:   md5.New(),
+		key: slices.Clone(serverMAC),
+	}
 
 	// Create the server RC4 cipher
-	cipher, err := rc4.NewCipher(serverKey)
+	s.cipher, err = rc4.NewCipher(serverKey)
 	if err != nil {
 		return err
 	}
 
 	// Create the client RC4 cipher
-	clientCipher, err := rc4.NewCipher(clientKey)
+	s.clientCipher, err = rc4.NewCipher(clientKey)
 	if err != nil {
 		return err
 	}
 
-	// Create the mac function
-	macFn := ssl30MAC{
-		h:   md5.New(),
-		key: slices.Clone(serverMAC),
-	}
-
 	// Decrypt client finish
-	clientCipher.XORKeyStream(clientFinish, clientFinish)
-	finishHash.Write(clientFinish[:0x28])
+	s.clientCipher.XORKeyStream(clientFinish, clientFinish)
+	finishHash.Write(clientFinish[:len(clientFinish)-md5.Size])
 
-	// Send ChangeCipherSpec
-	_, err = c.Conn.Write([]byte{
+	// Change Cipher Spec
+	c.Conn.Write([]byte{
 		0x14,       // Content Type (Change Cipher Spec)
 		0x03, 0x00, // Version (SSLv3)
 		0x00, 0x01, // Length (1)
 		0x01, // Change Cipher Spec Message
 	})
-	if err != nil {
-		return err
-	}
 
 	finishedRecord := []byte{
 		0x16,       // Content Type (Handshake)
@@ -332,26 +331,15 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		0x00, 0x28, // Length (40)
 	}
 
-	out := finishHash.serverSum(masterSecret)
-
 	// Encrypt the finished record
-	finishedRecord, _ = encryptSSL(macFn, cipher, append([]byte{
+	finishedRecord, s.seq = encryptSSL(s.macFn, s.cipher, append([]byte{
 		0x14,             // Handshake Type (Finished)
 		0x00, 0x00, 0x24, // Length (36)
-	}, out[:36]...), 0, finishedRecord)
+	}, finishHash.serverSum(masterSecret)...), s.seq, finishedRecord)
 
-	_, err = c.Conn.Write(finishedRecord)
-	if err != nil {
-		return err
-	}
+	c.Conn.Write(finishedRecord)
 
-	c.session = &session{
-		Conn:         c.Conn,
-		macFn:        macFn,
-		cipher:       cipher,
-		clientCipher: clientCipher,
-		seq:          1,
-	}
+	c.session = &s
 	c.handshaked = true
 
 	return nil
