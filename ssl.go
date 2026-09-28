@@ -359,58 +359,54 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 
 type session struct {
 	net.Conn
-	bufferSize    int
-	macFn         macFunction
-	cipher        *rc4.Cipher
-	clientCipher  *rc4.Cipher
-	seq           uint64
-	decodedBuffer bytes.Buffer
-	encodedBuffer bytes.Buffer
+	macFn        macFunction
+	cipher       *rc4.Cipher
+	clientCipher *rc4.Cipher
+	seq          uint64
+	plaintext    bytes.Buffer
 }
 
 func (s *session) Read(b []byte) (n int, err error) {
-	if s.decodedBuffer.Len() != 0 {
-		return s.decodedBuffer.Read(b)
+	if s.plaintext.Len() != 0 {
+		return s.plaintext.Read(b)
 	}
 
-	var recordLength uint16
-	for {
-		for s.encodedBuffer.Len() < int(recordLength)+5 {
-			readBuf := make([]byte, 1024)
-			n, err = s.Conn.Read(readBuf)
-			if err != nil {
-				return 0, err
-			}
-
-			s.encodedBuffer.Write(readBuf[:n])
-		}
-
-		buf := s.encodedBuffer.Bytes()
-		if buf[0] < 0x15 || buf[0] > 0x17 {
-			return 0, errors.New("invalid record type")
-		}
-
-		if !bytes.Equal(buf[1:3], []byte{0x03, 0x00}) {
-			return 0, errors.New("invalid SSL version")
-		}
-
-		recordLength = binary.BigEndian.Uint16(buf[3:])
-		if recordLength < 1+md5.Size || (recordLength+5) > 0x1000 {
-			return 0, errors.New("invalid record length")
-		}
-
-		if s.encodedBuffer.Len() >= int(recordLength)+5 {
-			break
-		}
+	recordType, err := read[byte](s.Conn)
+	if err != nil {
+		return 0, err
+	}
+	if recordType != 0x15 && recordType != 0x17 {
+		return 0, errors.New("invalid record type")
 	}
 
-	buf := s.encodedBuffer.Bytes()
-	// Decrypt content
-	s.clientCipher.XORKeyStream(buf[5:5+recordLength], buf[5:5+recordLength])
+	version, err := readN[byte](s.Conn, 2)
+	if err != nil {
+		return 0, err
+	}
+	if !bytes.Equal(version, []byte{0x03, 0x00}) {
+		return 0, errors.New("invalid ssl version")
+	}
 
-	if buf[0] != 0x17 {
-		if buf[0] == 0x15 || buf[5] == 0x01 || buf[6] == 0x00 {
-			// Alert: connection closed
+	recordLen, err := read[uint16](s.Conn)
+	if err != nil {
+		return 0, err
+	}
+	if recordLen < 1+md5.Size || 5+recordLen > 0x4000 {
+		return 0, errors.New("invalid record length")
+	}
+
+	record, err := readN[byte](s.Conn, int(recordLen))
+	if err != nil {
+		return 0, err
+	}
+
+	// decrypt record
+	s.clientCipher.XORKeyStream(record, record)
+
+	// if alert
+	if recordType == 0x15 {
+		if record[0] == 0x01 && record[1] == 0x00 {
+			// connection closed
 			err = s.Close()
 			if err != nil {
 				return 0, err
@@ -419,17 +415,19 @@ func (s *session) Read(b []byte) (n int, err error) {
 			return 0, io.EOF
 		}
 
-		return 0, errors.New("non-application data received")
+		return 0, errors.New("unhandled alert received")
 	}
 
-	// Write the decrypted content to the buffer
-	if int(recordLength-md5.Size) > len(b) {
-		s.decodedBuffer.Write(buf[5+len(b) : 5+recordLength-md5.Size])
+	// throw away the client MAC
+	data := record[:recordLen-md5.Size]
+
+	// copy to b, buffer the rest
+	n = copy(b, data)
+	if n < len(data) {
+		s.plaintext.Write(data[n:])
 	}
 
-	s.encodedBuffer.Next(5 + int(recordLength))
-
-	return copy(b, buf[5:5+recordLength-md5.Size]), nil
+	return n, nil
 }
 
 func (s *session) Write(b []byte) (n int, err error) {
