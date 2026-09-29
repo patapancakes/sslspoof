@@ -12,8 +12,8 @@ import (
 
 var oidMD5WithRSA = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 4}
 
-// workaround since x509.CreateCertificate disallows MD5WithRSA signatures
-func CreateCertificate(rand io.Reader, template, parent *x509.Certificate, pub, priv any) ([]byte, error) {
+// workaround since x509.createCertificate disallows MD5WithRSA signatures
+func createCertificate(rand io.Reader, template, parent *x509.Certificate, pub, priv any) ([]byte, error) {
 	t := *template
 
 	isMD5 := template.SignatureAlgorithm == x509.MD5WithRSA

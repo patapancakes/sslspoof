@@ -59,14 +59,6 @@ var (
 	authorityKey  = mustParsePrivateKeyPEM(authorityKeyPEM)
 )
 
-func appendUint24(b []byte, v uint32) []byte {
-	return append(b,
-		byte(v>>16),
-		byte(v>>8),
-		byte(v),
-	)
-}
-
 func read[T any](r io.Reader) (T, error) {
 	var value T
 
@@ -79,6 +71,14 @@ func readN[T any](r io.Reader, n int) ([]T, error) {
 
 	err := binary.Read(r, binary.BigEndian, &value)
 	return value, err
+}
+
+func appendUint24(b []byte, v uint32) []byte {
+	return append(b,
+		byte(v>>16),
+		byte(v>>8),
+		byte(v),
+	)
 }
 
 type conn struct {
@@ -106,7 +106,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	finishHash := newFinishedHash()
 
 	var clientHelloLen int
-	if isSSL2 { // SSLv2
+	if isSSL2 {
 		clientHelloLen = int(clientHelloHeader[1])
 		if clientHelloLen < 0x20 {
 			return errors.New("short client hello")
@@ -116,7 +116,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		clientHelloLen -= 3
 
 		finishHash.Write(clientHelloHeader[2:])
-	} else { // SSLv3
+	} else {
 		clientHelloLen = int(binary.BigEndian.Uint16(clientHelloHeader[3:]))
 		if clientHelloLen < 0x34 {
 			return errors.New("short client hello")
@@ -129,6 +129,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	}
 
 	needsExport := true
+	var clientVersion []byte
 	var clientRandom []byte
 
 	if isSSL2 {
@@ -144,7 +145,9 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 			}
 		}
 
-		clientRandom = clientHelloBody[clientHelloLen-32:]
+		clientVersion = clientHelloHeader[3:]
+		clientRandom = clientHelloBody[6+ciphersLen:]
+		clientRandom = append(make([]byte, max(0, 32-len(clientRandom))), clientRandom...) // right justify
 	} else {
 		ciphersLen := binary.BigEndian.Uint16(clientHelloBody[39:])
 		if clientHelloLen < 39+2+int(ciphersLen) {
@@ -158,6 +161,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 			}
 		}
 
+		clientVersion = clientHelloBody[4 : 4+1]
 		clientRandom = clientHelloBody[6 : 6+32]
 	}
 
@@ -198,7 +202,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	finishHash.Write(serverHello[5:])
 	c.Conn.Write(serverHello)
 
-	// Certificates
+	// Server Certificates
 	algo := x509.SHA1WithRSA
 	if useMD5 {
 		algo = x509.MD5WithRSA
@@ -209,7 +213,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		certKey, _ = rsa.GenerateKey(rand.Reader, 512)
 	}
 
-	cert, err := CreateCertificate(rand.Reader, &x509.Certificate{
+	cert, err := createCertificate(rand.Reader, &x509.Certificate{
 		Subject:            pkix.Name{CommonName: host},
 		NotBefore:          intermediateCert.NotBefore,
 		NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
@@ -270,7 +274,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	if !bytes.HasPrefix(clientKeyExchange, []byte{
 		0x16,       // Content Type (Handshake)
 		0x03, 0x00, // Version (SSLv3)
-		0x00, byte(1 + 3 + certKey.PublicKey.Size()), // Length (4 + RSA Key Size)
+		0x00, byte(4 + certKey.PublicKey.Size()), // Length (4 + RSA Key Size)
 		0x10,                                       // Handshake Type (Client Key Exchange)
 		0x00, 0x00, byte(certKey.PublicKey.Size()), // Length (RSA Key Size)
 	}) {
@@ -280,7 +284,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	encryptedPreMasterSecret := clientKeyExchange[5+4:]
 	finishHash.Write(clientKeyExchange[5:])
 
-	// Change Cipher Spec
+	// Client Change Cipher Spec
 	changeCipherSpec, err := readN[byte](c.Conn, 5+1)
 	if err != nil {
 		return errors.New("failed to read client change cipher spec")
@@ -294,7 +298,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		return errors.New("invalid client change cipher spec")
 	}
 
-	// Finished
+	// Client Finished
 	finished, err := readN[byte](c.Conn, 5+4+md5.Size+sha1.Size+md5.Size)
 	if err != nil {
 		return errors.New("failed to read client finished")
@@ -317,7 +321,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	if len(preMasterSecret) != 48 {
 		return errors.New("invalid pre master secret length")
 	}
-	if !bytes.HasPrefix(preMasterSecret, []byte{0x03, 0x00}) {
+	if !bytes.HasPrefix(preMasterSecret, clientVersion) {
 		return errors.New("invalid ssl version in pre master secret")
 	}
 
@@ -355,11 +359,11 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		return err
 	}
 
-	// Decrypt client finish
+	// Decrypt client Finished
 	s.clientCipher.XORKeyStream(clientFinish, clientFinish)
 	finishHash.Write(clientFinish[:len(clientFinish)-md5.Size])
 
-	// Change Cipher Spec
+	// Server Change Cipher Spec
 	c.Conn.Write([]byte{
 		0x14,       // Content Type (Change Cipher Spec)
 		0x03, 0x00, // Version (SSLv3)
@@ -367,13 +371,14 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		0x01, // Change Cipher Spec Message
 	})
 
+	// Server Finished
 	finishedRecord := []byte{
 		0x16,       // Content Type (Handshake)
 		0x03, 0x00, // Version (SSLv3)
 		0x00, 0x28, // Length (40)
 	}
 
-	// Encrypt the finished record
+	// Encrypt server Finished record
 	finishedRecord, s.seq = encrypt(s.macFn, s.cipher, append([]byte{
 		0x14,             // Handshake Type (Finished)
 		0x00, 0x00, 0x24, // Length (36)
