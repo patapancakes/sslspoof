@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strconv"
 	"time"
 
 	_ "embed"
@@ -49,6 +50,10 @@ var (
 
 	authorityCert = parseCertificatePEM(authorityCertPEM)
 	authorityKey  = parseKeyPEM(authorityKeyPEM)
+
+	weakKey, _ = rsa.GenerateKey(rand.Reader, 512)
+
+	certs = make(map[string][]byte) // TODO: make thread-safe
 )
 
 func read[T any](r io.Reader) (T, error) {
@@ -195,24 +200,29 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	c.Conn.Write(serverHello)
 
 	// Server Certificates
-	algo := x509.SHA1WithRSA
-	if useMD5 {
-		algo = x509.MD5WithRSA
-	}
-
 	certKey := authorityKey
 	if needsExport {
-		certKey, _ = rsa.GenerateKey(rand.Reader, 512)
+		certKey = weakKey
 	}
 
-	cert, err := createCertificate(rand.Reader, &x509.Certificate{
-		Subject:            pkix.Name{CommonName: host},
-		NotBefore:          intermediateCert.NotBefore,
-		NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
-		SignatureAlgorithm: algo,
-	}, authorityCert, &certKey.PublicKey, authorityKey)
-	if err != nil {
-		return err
+	cert, ok := certs[host+strconv.Itoa(certKey.PublicKey.Size())]
+	if !ok {
+		algo := x509.SHA1WithRSA
+		if useMD5 {
+			algo = x509.MD5WithRSA
+		}
+
+		cert, err = createCertificate(rand.Reader, &x509.Certificate{
+			Subject:            pkix.Name{CommonName: host},
+			NotBefore:          intermediateCert.NotBefore,
+			NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
+			SignatureAlgorithm: algo,
+		}, authorityCert, &certKey.PublicKey, authorityKey)
+		if err != nil {
+			return err
+		}
+
+		certs[host+strconv.Itoa(certKey.PublicKey.Size())] = cert
 	}
 
 	certs := [][]byte{cert, authorityCert.Raw, intermediateCert.Raw}
