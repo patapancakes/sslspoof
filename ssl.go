@@ -213,7 +213,11 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		}
 
 		cert, err = createCertificate(rand.Reader, &x509.Certificate{
-			Subject:            pkix.Name{CommonName: host},
+			Subject: pkix.Name{
+				Organization:       []string{"sslspoof"},
+				OrganizationalUnit: []string{"pancakes at mooglepowered dot com"},
+				CommonName:         host,
+			},
 			NotBefore:          intermediateCert.NotBefore,
 			NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
 			SignatureAlgorithm: algo,
