@@ -32,31 +32,23 @@ var (
 	authorityKeyPEM []byte
 )
 
-func mustParseCertificatePEM(b []byte) *x509.Certificate {
+func parseCertificatePEM(b []byte) *x509.Certificate {
 	certBlock, _ := pem.Decode(b)
-	cert, err := x509.ParseCertificate(certBlock.Bytes)
-	if err != nil {
-		panic(err)
-	}
-
+	cert, _ := x509.ParseCertificate(certBlock.Bytes)
 	return cert
 }
 
-func mustParsePrivateKeyPEM(b []byte) *rsa.PrivateKey {
+func parseKeyPEM(b []byte) *rsa.PrivateKey {
 	keyBlock, _ := pem.Decode(b)
-	key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
-	if err != nil {
-		panic(err)
-	}
-
+	key, _ := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 	return key.(*rsa.PrivateKey)
 }
 
 var (
-	intermediateCert = mustParseCertificatePEM(intermediateCertPEM)
+	intermediateCert = parseCertificatePEM(intermediateCertPEM)
 
-	authorityCert = mustParseCertificatePEM(authorityCertPEM)
-	authorityKey  = mustParsePrivateKeyPEM(authorityKeyPEM)
+	authorityCert = parseCertificatePEM(authorityCertPEM)
+	authorityKey  = parseKeyPEM(authorityKeyPEM)
 )
 
 func read[T any](r io.Reader) (T, error) {
