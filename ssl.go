@@ -472,11 +472,12 @@ func (s *session) Write(b []byte) (n int, err error) {
 		record = binary.BigEndian.AppendUint16(record, uint16(len(chunk)))
 
 		record, s.seq = encrypt(s.macFn, s.cipher, chunk, s.seq, record)
-		n, err := s.Conn.Write(record)
-		written += n
+		_, err := s.Conn.Write(record)
 		if err != nil {
 			return written, err
 		}
+
+		written += len(chunk)
 	}
 
 	return written, nil
