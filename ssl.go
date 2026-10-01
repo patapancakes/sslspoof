@@ -7,53 +7,13 @@ import (
 	"crypto/rc4"
 	"crypto/rsa"
 	"crypto/sha1"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
 	"net"
 	"slices"
-	"strconv"
-	"time"
-
-	_ "embed"
-)
-
-var (
-	//go:embed data/intermediate.crt
-	intermediateCertPEM []byte
-
-	//go:embed data/authority.crt
-	authorityCertPEM []byte
-	//go:embed data/authority.key
-	authorityKeyPEM []byte
-)
-
-func parseCertificatePEM(b []byte) *x509.Certificate {
-	certBlock, _ := pem.Decode(b)
-	cert, _ := x509.ParseCertificate(certBlock.Bytes)
-	return cert
-}
-
-func parseKeyPEM(b []byte) *rsa.PrivateKey {
-	keyBlock, _ := pem.Decode(b)
-	key, _ := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
-	return key.(*rsa.PrivateKey)
-}
-
-var (
-	intermediateCert = parseCertificatePEM(intermediateCertPEM)
-
-	authorityCert = parseCertificatePEM(authorityCertPEM)
-	authorityKey  = parseKeyPEM(authorityKeyPEM)
-
-	weakKey, _ = rsa.GenerateKey(rand.Reader, 512)
-
-	certs = make(map[string][]byte) // TODO: make thread-safe
 )
 
 func read[T any](r io.Reader) (T, error) {
@@ -80,7 +40,8 @@ func appendUint24(b []byte, v uint32) []byte {
 
 type conn struct {
 	net.Conn
-	session io.ReadWriter
+	listener *Listener
+	session  io.ReadWriter
 }
 
 func (c *conn) Read(b []byte) (int, error) {
@@ -92,7 +53,7 @@ func (c *conn) Write(b []byte) (int, error) {
 }
 
 // handshake handles the SSL request, and creates session for further communication.
-func (c *conn) handshake(host string, useMD5 bool) error {
+func (c *conn) handshake() error {
 	// Client Hello
 	clientHelloHeader, err := readN[byte](c.Conn, 5)
 	if err != nil {
@@ -125,7 +86,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		return err
 	}
 
-	needsExport := true
+	needsWeak := weakKey != nil
 	var clientVersion []byte
 	var clientRandom []byte
 
@@ -137,7 +98,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		for chunk := range slices.Chunk(clientHelloBody[6:6+ciphersLen], 3) {
 			// look for SSL_RSA_WITH_RC4_128_MD5
 			if bytes.Equal(chunk, []byte{0x00, 0x00, 0x04}) {
-				needsExport = false
+				needsWeak = false
 				break
 			}
 		}
@@ -153,7 +114,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 		for chunk := range slices.Chunk(clientHelloBody[39+2:39+2+ciphersLen], 2) {
 			// look for SSL_RSA_WITH_RC4_128_MD5
 			if bytes.Equal(chunk, []byte{0x00, 0x04}) {
-				needsExport = false
+				needsWeak = false
 				break
 			}
 		}
@@ -187,7 +148,7 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 
 	// Select cipher suite
 	cipherSuite := []byte{0x00, 0x04} // SSL_RSA_WITH_RC4_128_MD5
-	if needsExport {
+	if needsWeak {
 		cipherSuite = []byte{0x00, 0x03} // SSL_RSA_EXPORT_WITH_RC4_40_MD5
 	}
 
@@ -200,33 +161,11 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	c.Conn.Write(serverHello)
 
 	// Server Certificates
+	cert := c.listener.cert
 	certKey := authorityKey
-	if needsExport {
+	if needsWeak {
+		cert = c.listener.weakCert
 		certKey = weakKey
-	}
-
-	cert, ok := certs[host+strconv.Itoa(certKey.PublicKey.Size())]
-	if !ok {
-		algo := x509.SHA1WithRSA
-		if useMD5 {
-			algo = x509.MD5WithRSA
-		}
-
-		cert, err = createCertificate(rand.Reader, &x509.Certificate{
-			Subject: pkix.Name{
-				Organization:       []string{"sslspoof"},
-				OrganizationalUnit: []string{"pancakes at mooglepowered dot com"},
-				CommonName:         host,
-			},
-			NotBefore:          intermediateCert.NotBefore,
-			NotAfter:           time.Now().UTC().Add(time.Hour * 24 * 365 * 5),
-			SignatureAlgorithm: algo,
-		}, authorityCert, &certKey.PublicKey, authorityKey)
-		if err != nil {
-			return err
-		}
-
-		certs[host+strconv.Itoa(certKey.PublicKey.Size())] = cert
 	}
 
 	certs := [][]byte{cert, authorityCert.Raw, intermediateCert.Raw}
@@ -335,12 +274,12 @@ func (c *conn) handshake(host string, useMD5 bool) error {
 	prf30(masterSecret, preMasterSecret, []byte("master secret"), append(clientRandom, serverRandom...))
 
 	keyLen := 16 // 128-bit
-	if needsExport {
+	if needsWeak {
 		keyLen = 5 // 40-bit
 	}
 
 	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, md5.Size, keyLen, 0)
-	if needsExport {
+	if needsWeak {
 		clientKey = exportRC4Key(clientKey, clientRandom, serverRandom, true)
 		serverKey = exportRC4Key(serverKey, clientRandom, serverRandom, false)
 	}
