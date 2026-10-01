@@ -91,8 +91,8 @@ func (c *conn) handshake() error {
 	var clientRandom []byte
 
 	if isSSL2 {
-		ciphersLen := binary.BigEndian.Uint16(clientHelloBody)
-		if clientHelloLen < 6+int(ciphersLen) {
+		ciphersLen := int(binary.BigEndian.Uint16(clientHelloBody))
+		if clientHelloLen < 6+ciphersLen {
 			return errors.New("short client hello")
 		}
 		for chunk := range slices.Chunk(clientHelloBody[6:6+ciphersLen], 3) {
@@ -107,11 +107,16 @@ func (c *conn) handshake() error {
 		clientRandom = clientHelloBody[6+ciphersLen:]
 		clientRandom = append(make([]byte, max(0, 32-len(clientRandom))), clientRandom...) // right justify
 	} else {
-		ciphersLen := binary.BigEndian.Uint16(clientHelloBody[39:])
-		if clientHelloLen < 39+2+int(ciphersLen) {
+		sessionLen := int(clientHelloBody[38])
+		if clientHelloLen < 39+sessionLen {
 			return errors.New("short client hello")
 		}
-		for chunk := range slices.Chunk(clientHelloBody[39+2:39+2+ciphersLen], 2) {
+
+		ciphersLen := int(binary.BigEndian.Uint16(clientHelloBody[39+sessionLen:]))
+		if clientHelloLen < 39+sessionLen+2+ciphersLen {
+			return errors.New("short client hello")
+		}
+		for chunk := range slices.Chunk(clientHelloBody[39+sessionLen+2:39+sessionLen+2+ciphersLen], 2) {
 			// look for SSL_RSA_WITH_RC4_128_MD5
 			if bytes.Equal(chunk, []byte{0x00, 0x04}) {
 				needsWeak = false
