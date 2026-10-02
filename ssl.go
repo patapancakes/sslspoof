@@ -2,6 +2,7 @@ package sslspoof
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rc4"
@@ -140,7 +141,7 @@ func (c *conn) handshake() error {
 		0x03, 0x00, // Version (SSLv3)
 	}
 
-	serverRandom := make([]byte, 0x20)
+	serverRandom := make([]byte, 32)
 	_, err = rand.Read(serverRandom)
 	if err != nil {
 		return fmt.Errorf("failed to generate random bytes: %w", err)
@@ -292,22 +293,11 @@ func (c *conn) handshake() error {
 	s := session{Conn: c.Conn}
 
 	// Create the MAC function
-	s.macFn = ssl30MAC{
-		h:   md5.New(),
-		key: slices.Clone(serverMAC),
-	}
+	s.macFn = ssl30MAC{h: md5.New(), key: serverMAC}
 
-	// Create the server RC4 cipher
-	s.cipher, err = rc4.NewCipher(serverKey)
-	if err != nil {
-		return err
-	}
-
-	// Create the client RC4 cipher
-	s.clientCipher, err = rc4.NewCipher(clientKey)
-	if err != nil {
-		return err
-	}
+	// Create the RC4 ciphers
+	s.cipher, _ = rc4.NewCipher(serverKey)
+	s.clientCipher, _ = rc4.NewCipher(clientKey)
 
 	// Decrypt client Finished
 	s.clientCipher.XORKeyStream(clientFinish, clientFinish)
@@ -357,11 +347,10 @@ func exportRC4Key(key, clientRandom, serverRandom []byte, client bool) []byte {
 
 type session struct {
 	net.Conn
-	macFn        macFunction
-	cipher       *rc4.Cipher
-	clientCipher *rc4.Cipher
-	seq          uint64
-	plaintext    bytes.Buffer
+	cipher, clientCipher cipher.Stream
+	macFn                macFunction
+	seq                  uint64
+	plaintext            bytes.Buffer
 }
 
 func (s *session) Read(b []byte) (n int, err error) {
@@ -592,13 +581,13 @@ func (h finishedHash) serverSum(masterSecret []byte) []byte {
 	return finishedSum30(h.serverMD5, h.server, masterSecret, [4]byte{0x53, 0x52, 0x56, 0x52})
 }
 
-func encrypt(macFn macFunction, cipher *rc4.Cipher, payload []byte, seq uint64, record []byte) ([]byte, uint64) {
+func encrypt(macFn macFunction, cipher cipher.Stream, payload []byte, seq uint64, record []byte) ([]byte, uint64) {
 	mac := macFn.MAC([]byte{}, binary.BigEndian.AppendUint64([]byte{}, seq), record[:5], payload, nil)
 
 	record = append(append(bytes.Clone(record[:5]), payload...), mac...)
 	cipher.XORKeyStream(record[5:], record[5:])
 
-	// Update length to include nonce, MAC and any block padding needed.
+	// Update length to include MAC.
 	binary.BigEndian.PutUint16(record[3:], uint16(len(record)-5))
 
 	return record, seq + 1
