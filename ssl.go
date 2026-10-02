@@ -31,6 +31,27 @@ func readN[T any](r io.Reader, n int) ([]T, error) {
 	return value, err
 }
 
+type recordHeader struct {
+	ContentType byte
+	Version     [2]byte
+	Length      uint16
+}
+
+type record struct {
+	recordHeader
+	Fragment []byte
+}
+
+func readRecord(r io.Reader) (rec record, err error) {
+	rec.recordHeader, err = read[recordHeader](r)
+	if err != nil {
+		return
+	}
+
+	rec.Fragment, err = readN[byte](r, int(rec.Length))
+	return
+}
+
 func appendUint24(b []byte, v uint32) []byte {
 	return append(b,
 		byte(v>>16),
@@ -82,7 +103,7 @@ func (c *conn) handshake() error {
 		}
 	}
 
-	clientHelloBody, err := readN[byte](c.Conn, clientHelloLen)
+	clientHello, err := readN[byte](c.Conn, clientHelloLen)
 	if err != nil {
 		return err
 	}
@@ -92,11 +113,11 @@ func (c *conn) handshake() error {
 	var clientRandom []byte
 
 	if isSSL2 {
-		ciphersLen := int(binary.BigEndian.Uint16(clientHelloBody))
+		ciphersLen := int(binary.BigEndian.Uint16(clientHello))
 		if clientHelloLen < 6+ciphersLen {
 			return errors.New("short client hello")
 		}
-		for chunk := range slices.Chunk(clientHelloBody[6:6+ciphersLen], 3) {
+		for chunk := range slices.Chunk(clientHello[6:6+ciphersLen], 3) {
 			// look for SSL_RSA_WITH_RC4_128_MD5
 			if bytes.Equal(chunk, []byte{0x00, 0x00, 0x04}) {
 				needsWeak = false
@@ -105,19 +126,19 @@ func (c *conn) handshake() error {
 		}
 
 		clientVersion = clientHelloHeader[3:]
-		clientRandom = clientHelloBody[6+ciphersLen:]
+		clientRandom = clientHello[6+ciphersLen:]
 		clientRandom = append(make([]byte, max(0, 32-len(clientRandom))), clientRandom...) // right justify
 	} else {
-		sessionLen := int(clientHelloBody[38])
+		sessionLen := int(clientHello[38])
 		if clientHelloLen < 39+sessionLen {
 			return errors.New("short client hello")
 		}
 
-		ciphersLen := int(binary.BigEndian.Uint16(clientHelloBody[39+sessionLen:]))
+		ciphersLen := int(binary.BigEndian.Uint16(clientHello[39+sessionLen:]))
 		if clientHelloLen < 39+sessionLen+2+ciphersLen {
 			return errors.New("short client hello")
 		}
-		for chunk := range slices.Chunk(clientHelloBody[39+sessionLen+2:39+sessionLen+2+ciphersLen], 2) {
+		for chunk := range slices.Chunk(clientHello[39+sessionLen+2:39+sessionLen+2+ciphersLen], 2) {
 			// look for SSL_RSA_WITH_RC4_128_MD5
 			if bytes.Equal(chunk, []byte{0x00, 0x04}) {
 				needsWeak = false
@@ -125,30 +146,31 @@ func (c *conn) handshake() error {
 			}
 		}
 
-		clientVersion = clientHelloBody[4 : 4+1]
-		clientRandom = clientHelloBody[6 : 6+32]
+		clientVersion = clientHello[4 : 4+1]
+		clientRandom = clientHello[6 : 6+32]
 	}
 
-	finishHash.Write(clientHelloBody)
+	finishHash.Write(clientHello)
 
 	// Server Hello
 	serverHello := []byte{
-		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSLv3)
-		0x00, 0x2A, // Length (42)
-		0x02,             // Handshake Type (Server Hello)
-		0x00, 0x00, 0x26, // Length (38)
-		0x03, 0x00, // Version (SSLv3)
+		0x16,       // content type (Handshake)
+		0x03, 0x00, // version (SSLv3)
+		0x00, 0x2A, // record length (42)
+		0x02,             // handshake type (Server Hello)
+		0x00, 0x00, 0x26, // length (38)
+		0x03, 0x00, // version (SSLv3)
 	}
 
+	// server random
 	serverRandom := make([]byte, 32)
 	rand.Read(serverRandom)
 	serverHello = append(serverHello, serverRandom...)
 
-	// Send an empty session ID
+	// session ID
 	serverHello = append(serverHello, 0x00)
 
-	// Select cipher suite
+	// cipher suite
 	cipherSuite := []byte{0x00, 0x04} // SSL_RSA_WITH_RC4_128_MD5
 	if needsWeak {
 		cipherSuite = []byte{0x00, 0x03} // SSL_RSA_EXPORT_WITH_RC4_40_MD5
@@ -156,13 +178,13 @@ func (c *conn) handshake() error {
 
 	serverHello = append(serverHello, cipherSuite...)
 
-	// Select compression method
+	// compression method
 	serverHello = append(serverHello, 0x00) // NULL
 
 	finishHash.Write(serverHello[5:])
 	c.Conn.Write(serverHello)
 
-	// Server Certificates
+	// Certificates
 	cert := c.listener.cert
 	certKey := authorityKey
 	if needsWeak {
@@ -178,20 +200,20 @@ func (c *conn) handshake() error {
 	}
 
 	certificates := []byte{
-		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSLv3)
+		0x16,       // content type (Handshake)
+		0x03, 0x00, // version (SSLv3)
 	}
 
-	// Length of the record
+	// length of record
 	certificates = binary.BigEndian.AppendUint16(certificates, uint16(4+3+(len(certs)*3)+certsLen))
 
-	// Handshake Type (Certificate)
+	// handshake type (Certificate)
 	certificates = append(certificates, 0x0B)
 
-	// Length of handshake message
+	// length of handshake message
 	certificates = appendUint24(certificates, uint32(3+(len(certs)*3)+certsLen))
 
-	// Length of certificates
+	// length of certificates
 	certificates = appendUint24(certificates, uint32((len(certs)*3)+certsLen))
 
 	for _, cert := range certs {
@@ -204,27 +226,27 @@ func (c *conn) handshake() error {
 
 	// Server Hello Done
 	serverHelloDone := []byte{
-		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSLv3)
-		0x00, 0x04, // Length (4)
-		0x0E,             // Handshake Type (Server Hello Done)
-		0x00, 0x00, 0x00, // Length (0)
+		0x16,       // content type (Handshake)
+		0x03, 0x00, // version (SSLv3)
+		0x00, 0x04, // record length (4)
+		0x0E,             // handshake type (Server Hello Done)
+		0x00, 0x00, 0x00, // length (0)
 	}
 
 	finishHash.Write(serverHelloDone[5:])
 	c.Conn.Write(serverHelloDone)
 
 	// Client Key Exchange
-	clientKeyExchange, err := readN[byte](c.Conn, 5+4+certKey.PublicKey.Size())
-	if err != nil {
+	clientKeyExchange, err := readRecord(c.Conn)
+	if err != nil || len(clientKeyExchange.Fragment) < 4 {
 		return errors.New("failed to read client key exchange")
 	}
 
-	encryptedPreMasterSecret := clientKeyExchange[5+4:]
-	finishHash.Write(clientKeyExchange[5:])
+	encryptedPreMasterSecret := clientKeyExchange.Fragment[4:]
+	finishHash.Write(clientKeyExchange.Fragment)
 
-	// Decrypt the pre master secret using our RSA key
-	preMasterSecret, err := rsa.DecryptPKCS1v15(rand.Reader, certKey, encryptedPreMasterSecret)
+	// decrypt the pre master secret using our RSA key
+	preMasterSecret, err := rsa.DecryptPKCS1v15(nil, certKey, encryptedPreMasterSecret)
 	if err != nil {
 		return fmt.Errorf("failed to decrypt pre master secret: %w", err)
 	}
@@ -248,47 +270,43 @@ func (c *conn) handshake() error {
 
 	s := session{Conn: c.Conn}
 
-	// Create the MAC function
+	// create the MAC function and ciphers
 	s.macFn = ssl30MAC{h: md5.New(), key: serverMAC}
-
-	// Create the RC4 ciphers
 	s.cipher, _ = rc4.NewCipher(serverKey)
 	s.clientCipher, _ = rc4.NewCipher(clientKey)
 
-	// Client Change Cipher Spec
-	_, err = readN[byte](c.Conn, 5+1)
+	// (client) Change Cipher Spec
+	_, err = readRecord(c.Conn)
 	if err != nil {
 		return errors.New("failed to read client change cipher spec")
 	}
 
-	// Client Finished
-	clientFinished, err := readN[byte](c.Conn, 5+4+md5.Size+sha1.Size+md5.Size)
-	if err != nil {
+	// (client) Finished
+	clientFinished, err := readRecord(c.Conn)
+	if err != nil || len(clientFinished.Fragment) < md5.Size {
 		return errors.New("failed to read client finished")
 	}
 
-	clientFinish := clientFinished[5:]
+	s.clientCipher.XORKeyStream(clientFinished.Fragment, clientFinished.Fragment)
+	finishHash.Write(clientFinished.Fragment[:len(clientFinished.Fragment)-md5.Size])
 
-	s.clientCipher.XORKeyStream(clientFinish, clientFinish)
-	finishHash.Write(clientFinish[:len(clientFinish)-md5.Size])
-
-	// Server Change Cipher Spec
+	// (server) Change Cipher Spec
 	c.Conn.Write([]byte{
-		0x14,       // Content Type (Change Cipher Spec)
-		0x03, 0x00, // Version (SSLv3)
-		0x00, 0x01, // Length (1)
+		0x14,       // content type (Change Cipher Spec)
+		0x03, 0x00, // version (SSLv3)
+		0x00, 0x01, // record length (1)
 		0x01, // Change Cipher Spec Message
 	})
 
-	// Server Finished
+	// (server) Finished
 	finished := []byte{
-		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSLv3)
-		0x00, 0x28, // Length (40)
+		0x16,       // content type (Handshake)
+		0x03, 0x00, // version (SSLv3)
+		0x00, 0x28, // record length (40)
 	}
 	finished, s.seq = encrypt(s.macFn, s.seq, s.cipher, append([]byte{
-		0x14,             // Handshake Type (Finished)
-		0x00, 0x00, 0x24, // Length (36)
+		0x14,             // handshake type (Finished)
+		0x00, 0x00, 0x24, // length (36)
 	}, finishHash.serverSum(masterSecret)...), finished)
 
 	c.Conn.Write(finished)
@@ -325,41 +343,20 @@ func (s *session) Read(b []byte) (n int, err error) {
 		return s.plaintext.Read(b)
 	}
 
-	recordType, err := read[byte](s.Conn)
+	r, err := readRecord(s.Conn)
 	if err != nil {
 		return 0, err
 	}
-	if recordType != 0x15 && recordType != 0x17 {
-		return 0, errors.New("invalid record type")
-	}
-
-	version, err := readN[byte](s.Conn, 2)
-	if err != nil {
-		return 0, err
-	}
-	if !bytes.Equal(version, []byte{0x03, 0x00}) {
-		return 0, errors.New("invalid ssl version")
-	}
-
-	recordLen, err := read[uint16](s.Conn)
-	if err != nil {
-		return 0, err
-	}
-	if recordLen < 1+md5.Size || 5+recordLen > 0x4000 {
+	if r.Length < 1+md5.Size || 5+r.Length > 0x4000 {
 		return 0, errors.New("invalid record length")
 	}
 
-	record, err := readN[byte](s.Conn, int(recordLen))
-	if err != nil {
-		return 0, err
-	}
-
 	// decrypt record
-	s.clientCipher.XORKeyStream(record, record)
+	s.clientCipher.XORKeyStream(r.Fragment, r.Fragment)
 
 	// if alert
-	if recordType == 0x15 {
-		if record[0] == 0x01 && record[1] == 0x00 { // connection closed
+	if r.ContentType == 0x15 {
+		if r.Fragment[0] == 0x01 && r.Fragment[1] == 0x00 { // connection closed
 			s.Close()
 			return 0, io.EOF
 		}
@@ -368,12 +365,12 @@ func (s *session) Read(b []byte) (n int, err error) {
 	}
 
 	// throw away the client MAC
-	data := record[:recordLen-md5.Size]
+	plaintext := r.Fragment[4 : len(r.Fragment)-md5.Size]
 
 	// copy to b, buffer the rest
-	n = copy(b, data)
-	if n < len(data) {
-		s.plaintext.Write(data[n:])
+	n = copy(b, plaintext)
+	if n < len(plaintext) {
+		s.plaintext.Write(plaintext[n:])
 	}
 
 	return n, nil
