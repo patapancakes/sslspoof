@@ -92,7 +92,7 @@ func (l *Listener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		conn := &conn{Conn: c, listener: l}
+		conn := &Conn{Conn: c, listener: l}
 
 		err = conn.handshake()
 		if err != nil {

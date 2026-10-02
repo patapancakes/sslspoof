@@ -14,22 +14,22 @@ import (
 	"slices"
 )
 
-type conn struct {
+type Conn struct {
 	net.Conn
 	listener *Listener
 	session  io.ReadWriter
 }
 
-func (c *conn) Read(b []byte) (int, error) {
+func (c *Conn) Read(b []byte) (int, error) {
 	return c.session.Read(b)
 }
 
-func (c *conn) Write(b []byte) (int, error) {
+func (c *Conn) Write(b []byte) (int, error) {
 	return c.session.Write(b)
 }
 
 // handshake handles the SSL request, and creates session for further communication.
-func (c *conn) handshake() error {
+func (c *Conn) handshake() error {
 	// Client Hello
 	clientHelloHeader, err := readN[byte](c.Conn, 5)
 	if err != nil {
