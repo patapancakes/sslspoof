@@ -299,17 +299,17 @@ func (c *conn) handshake() error {
 }
 
 func exportRC4Key(key, clientRandom, serverRandom []byte, client bool) []byte {
-	b := bytes.Clone(key)
+	h := md5.New()
+	h.Write(key)
 	if client {
-		b = append(b, clientRandom...)
-		b = append(b, serverRandom...)
+		h.Write(clientRandom)
+		h.Write(serverRandom)
 	} else {
-		b = append(b, serverRandom...)
-		b = append(b, clientRandom...)
+		h.Write(serverRandom)
+		h.Write(clientRandom)
 	}
 
-	sum := md5.Sum(b)
-	return sum[:]
+	return h.Sum(nil)
 }
 
 type session struct {
