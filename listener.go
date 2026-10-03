@@ -43,12 +43,13 @@ var (
 	weakKey, _ = rsa.GenerateKey(rand.Reader, 512)
 )
 
-func NewListener(addr string, host string, md5 bool) (Listener, error) {
+func NewListener(addr string, host string, md5 bool) (*Listener, error) {
 	var l Listener
 	var err error
+
 	l.Listener, err = net.Listen("tcp", addr)
 	if err != nil {
-		return Listener{}, err
+		return nil, err
 	}
 
 	template := x509.Certificate{
@@ -67,17 +68,17 @@ func NewListener(addr string, host string, md5 bool) (Listener, error) {
 
 	l.cert, err = createCertificate(rand.Reader, &template, authorityCert, &authorityKey.PublicKey, authorityKey)
 	if err != nil {
-		return Listener{}, err
+		return nil, err
 	}
 
 	if weakKey != nil {
 		l.weakCert, err = createCertificate(rand.Reader, &template, authorityCert, &weakKey.PublicKey, authorityKey)
 		if err != nil {
-			return Listener{}, err
+			return nil, err
 		}
 	}
 
-	return l, nil
+	return &l, nil
 }
 
 type Listener struct {
@@ -92,7 +93,7 @@ func (l *Listener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		conn := &Conn{Conn: c, listener: l}
+		conn := Conn{Conn: c, listener: l}
 
 		err = conn.handshake()
 		if err != nil {
@@ -100,6 +101,6 @@ func (l *Listener) Accept() (net.Conn, error) {
 			continue
 		}
 
-		return conn, nil
+		return &conn, err
 	}
 }
