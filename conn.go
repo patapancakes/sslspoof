@@ -192,7 +192,7 @@ func (c *Conn) handshake() error {
 
 	// Client Key Exchange
 	clientKeyExchange, err := readRecord(c.Conn)
-	if err != nil || len(clientKeyExchange.Fragment) < 4 {
+	if err != nil || clientKeyExchange.Length < 4 {
 		return errors.New("failed to read client key exchange")
 	}
 
@@ -237,12 +237,12 @@ func (c *Conn) handshake() error {
 
 	// (client) Finished
 	clientFinished, err := readRecord(c.Conn)
-	if err != nil || len(clientFinished.Fragment) < md5.Size {
+	if err != nil || clientFinished.Length < md5.Size {
 		return errors.New("failed to read client finished")
 	}
 
 	s.clientCipher.XORKeyStream(clientFinished.Fragment, clientFinished.Fragment)
-	finishHash.Write(clientFinished.Fragment[:len(clientFinished.Fragment)-md5.Size])
+	finishHash.Write(clientFinished.Fragment[:clientFinished.Length-md5.Size])
 
 	// (server) Change Cipher Spec
 	c.Conn.Write([]byte{

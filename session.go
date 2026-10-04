@@ -46,7 +46,7 @@ func (s *session) Read(b []byte) (n int, err error) {
 	}
 
 	// throw away the client MAC
-	plaintext := r.Fragment[:len(r.Fragment)-md5.Size]
+	plaintext := r.Fragment[:r.Length-md5.Size]
 
 	// copy to b, buffer the rest
 	n = copy(b, plaintext)
